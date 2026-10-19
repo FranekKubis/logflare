@@ -59,6 +59,7 @@ defmodule Logflare.ContextCache.CacheBuster do
 
   def handle_info(%Transaction{changes: changes} = transaction, state) do
     Logger.debug("WAL record received from pubsub: #{inspect(transaction)}")
+    measure_transaction(transaction)
 
     for record <- changes,
         record = handle_record(record),
@@ -77,6 +78,28 @@ defmodule Logflare.ContextCache.CacheBuster do
 
     {:noreply, state}
   end
+
+  defp measure_transaction(%Transaction{changes: changes, commit_timestamp: committed_at}) do
+    if match?(%DateTime{}, committed_at) do
+      :telemetry.execute(
+        [:logflare, :cache_buster, :transaction],
+        %{lag: DateTime.diff(DateTime.utc_now(), committed_at, :millisecond)},
+        %{}
+      )
+    end
+
+    for %{relation: {_schema, table}} = change <- changes do
+      :telemetry.execute([:logflare, :cache_buster, :wal_record], %{count: 1}, %{
+        table: table,
+        operation: operation(change)
+      })
+    end
+  end
+
+  defp operation(%NewRecord{}), do: :insert
+  defp operation(%UpdatedRecord{}), do: :update
+  defp operation(%DeletedRecord{}), do: :delete
+  defp operation(_change), do: :truncate
 
   defp handle_record(%UpdatedRecord{
          relation: {_schema, "sources"},

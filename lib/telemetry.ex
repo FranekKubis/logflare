@@ -10,6 +10,8 @@ defmodule Logflare.Telemetry do
   alias Logflare.Backends.Adaptor.ClickHouseAdaptor
   alias Logflare.Backends.Adaptor.ClickHouseAdaptor.QueryConnectionSup
   alias Logflare.Cache.CachexOps
+  alias Logflare.Repo
+  alias Logflare.Repo.Replicas
 
   def start_link(arg), do: Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
 
@@ -88,6 +90,17 @@ defmodule Logflare.Telemetry do
     60_000,
     300_000
   ]
+
+  @wal_lag_buckets_ms [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000]
+
+  @replica_lag_query """
+  SELECT
+    pg_wal_lsn_diff($1::text::pg_lsn, pg_last_wal_replay_lsn())::bigint,
+    CASE
+      WHEN pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn() THEN 0
+      ELSE (extract(epoch FROM now() - pg_last_xact_replay_timestamp()) * 1000)::bigint
+    END
+  """
 
   @impl true
   def init(_arg) do
@@ -353,6 +366,26 @@ defmodule Logflare.Telemetry do
           "Total events dispatched from the spool consumer to their destination backends"
       ),
       counter("logflare.cache_buster.to_bust.count", tags: []),
+      counter("logflare.cache_buster.wal_record.count",
+        tags: [:table, :operation],
+        description: "WAL row changes received by this node, by table and operation"
+      ),
+      distribution("logflare.cache_buster.transaction.lag",
+        unit: :millisecond,
+        reporter_options: [buckets: @wal_lag_buckets_ms],
+        description:
+          "Time from a transaction's commit on the primary to its arrival in CacheBuster"
+      ),
+      last_value("logflare.repo.replica_lag.bytes",
+        tags: [:replica],
+        unit: :byte,
+        description: "WAL bytes the read replica has yet to replay"
+      ),
+      last_value("logflare.repo.replica_lag.time",
+        tags: [:replica],
+        unit: :millisecond,
+        description: "Age of the last transaction replayed on a read replica that is behind"
+      ),
       sum("logflare.logs.ingest_logs.drop_lql",
         event_name: [:logflare, :logs, :ingest_logs, :drop_lql],
         measurement: :count,
@@ -790,11 +823,51 @@ defmodule Logflare.Telemetry do
         {__MODULE__, :process_message_queue_metrics, []},
         {__MODULE__, :process_memory_metrics, []},
         {__MODULE__, :ets_table_metrics, []},
-        {__MODULE__, :clickhouse_read_pool_metrics, []}
+        {__MODULE__, :clickhouse_read_pool_metrics, []},
+        {__MODULE__, :replica_lag_metrics, []}
       ]
 
     cachex_metrics ++ process_metrics
   end
+
+  @doc """
+  Emits how far each read replica is behind the primary, in WAL bytes and in time, as a
+  `[:logflare, :repo, :replica_lag]` event per replica. Replicas that can't be queried, or
+  aren't physical standbys, are skipped.
+  """
+  @spec replica_lag_metrics() :: :ok
+  def replica_lag_metrics do
+    with [_ | _] = replicas <- Application.get_env(:logflare, :read_replicas, []),
+         {:ok, %{rows: [[primary_lsn]]}} <- Repo.query("SELECT pg_current_wal_lsn()::text") do
+      Enum.each(replicas, &emit_replica_lag(&1, primary_lsn))
+    end
+
+    :ok
+  end
+
+  defp emit_replica_lag(replica, primary_lsn) do
+    {name, repo} = replica_repo(replica)
+    previous_repo = Repo.put_dynamic_repo(repo)
+
+    try do
+      case Repo.query(@replica_lag_query, [primary_lsn]) do
+        {:ok, %{rows: [[bytes, ms]]}} when is_integer(bytes) and is_integer(ms) ->
+          :telemetry.execute(
+            [:logflare, :repo, :replica_lag],
+            %{bytes: max(bytes, 0), time: ms},
+            %{replica: name}
+          )
+
+        _not_a_standby_or_error ->
+          :ok
+      end
+    after
+      Repo.put_dynamic_repo(previous_repo)
+    end
+  end
+
+  defp replica_repo({key, _config}), do: {key, Replicas.lookup!(key)}
+  defp replica_repo(repo) when is_atom(repo), do: {inspect(repo), repo}
 
   @doc """
   Polls every active ClickHouse read pool on this node for `DBConnection` pool metrics

@@ -544,6 +544,31 @@ defmodule Logflare.TelemetryTest do
     end
   end
 
+  describe "replica_lag_metrics/0" do
+    setup do
+      previous = Application.get_env(:logflare, :read_replicas)
+      on_exit(fn -> Application.put_env(:logflare, :read_replicas, previous) end)
+
+      ref = :telemetry_test.attach_event_handlers(self(), [[:logflare, :repo, :replica_lag]])
+      [ref: ref]
+    end
+
+    test "emits nothing without replicas", %{ref: ref} do
+      Application.put_env(:logflare, :read_replicas, [])
+
+      assert :ok = Telemetry.replica_lag_metrics()
+      refute_received {[:logflare, :repo, :replica_lag], ^ref, _, _}
+    end
+
+    test "skips a replica that isn't a physical standby", %{ref: ref} do
+      Application.put_env(:logflare, :read_replicas, [Logflare.Repo])
+
+      assert :ok = Telemetry.replica_lag_metrics()
+      refute_received {[:logflare, :repo, :replica_lag], ^ref, _, _}
+      assert Logflare.Repo.get_dynamic_repo() == Logflare.Repo
+    end
+  end
+
   describe "clickhouse_read_pool_metrics/2" do
     setup do
       insert(:plan, name: "Free")
